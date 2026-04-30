@@ -293,7 +293,6 @@ bot.on('message', async (msg) => {
 })
 
 // ─── CRON ─────────────────────────────────────────────────────────────────────
-
 cron.schedule('0 23 * * *', async () => {
   const actives = await db.getAllActiveRestaurants()
   for (const rest of actives) {
@@ -302,4 +301,3 @@ cron.schedule('0 23 * * *', async () => {
 }, { timezone: 'Europe/Rome' })
 
 console.log("🚀 Bot Online con Supabase!")
-```[cite: 1, 2]
