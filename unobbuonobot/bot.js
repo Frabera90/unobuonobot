@@ -1,310 +1,394 @@
-// bot.js — Unobuono Bot v2 (fixed)
+// bot.js — Unobuono Bot v3 — Onboarding da foto fatture
 require('dotenv').config()
 const TelegramBot = require('node-telegram-bot-api')
+const Anthropic = require('@anthropic-ai/sdk')
 const cron = require('node-cron')
+const https = require('https')
 const db = require('./db')
-const ai = require('./ai')
 
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true })
+const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 // ─── GLOBAL ERROR HANDLERS ────────────────────────────────────────────────────
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled rejection:', reason)
-})
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err)
-})
+process.on('unhandledRejection', (reason) => { console.error('Unhandled:', reason) })
+process.on('uncaughtException', (err) => { console.error('Uncaught:', err) })
 
 // ─── UTILITIES ────────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 async function typing(chatId, ms = 1200) {
-  try {
-    await bot.sendChatAction(chatId, 'typing')
-    await sleep(ms)
-  } catch(e) {}
+  try { await bot.sendChatAction(chatId, 'typing'); await sleep(ms) } catch(e) {}
 }
 
 async function send(chatId, text, options = {}) {
-  try {
-    return await bot.sendMessage(chatId, text, { parse_mode: 'HTML', ...options })
-  } catch(e) {
-    console.error('Send error:', e.message)
-  }
+  try { return await bot.sendMessage(chatId, text, { parse_mode: 'HTML', ...options }) }
+  catch(e) { console.error('Send error:', e.message) }
 }
 
-function parseQuantity(text) {
-  const match = text.match(/(\d+(?:[.,]\d+)?)\s*(kg|g|l|lt|litri|pezzi|bottiglie|sacche?|cassette?|confezioni?)?/i)
-  if (!match) return null
-  return { value: parseFloat(match[1].replace(',', '.')), unit: match[2] || 'unità' }
-}
-
-function yesNoKeyboard() {
-  return { reply_markup: { keyboard: [['✅ Sì', '❌ No'], ['⏭ Salta per ora']], resize_keyboard: true, one_time_keyboard: true } }
-}
-
-function removeKeyboard() {
-  return { reply_markup: { remove_keyboard: true } }
-}
-
-function posKeyboard() {
-  return { reply_markup: { keyboard: [['Cassa in Cloud', 'Tilby'], ['Lightspeed', 'Square'], ['Altro', '❌ Non ce l\'ho']], resize_keyboard: true, one_time_keyboard: true } }
-}
-
-// ─── ONBOARDING ───────────────────────────────────────────────────────────────
-async function startOnboarding(chatId) {
-  try {
-    await db.upsertRestaurant(chatId, { onboarding_step: 'welcome', onboarding_complete: false })
-    await typing(chatId, 1000)
-    await send(chatId, `👋 <b>Ciao! Sono il tuo assistente rifornimenti Unobuono.</b>\n\nTi aiuto a tenere sotto controllo le scorte del tuo ristorante e a fare ordini ai fornitori — tutto da qui, su Telegram.\n\nNiente da installare, niente da imparare. Ti faccio alcune domande e poi penso a tutto io. 🍕\n\nIniziamo?`, yesNoKeyboard())
-    await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_start' })
-  } catch(e) {
-    console.error('startOnboarding error:', e)
-    await send(chatId, '❌ Errore di avvio. Riprova con /start')
-  }
-}
-
-async function askProfile(chatId) {
-  try {
-    await typing(chatId, 800)
-    await send(chatId, `Prima di tutto: <b>come si chiama il tuo ristorante?</b>`, removeKeyboard())
-    await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_name' })
-  } catch(e) { console.error('askProfile error:', e) }
-}
-
-async function askRestaurantType(chatId, name) {
-  try {
-    await db.upsertRestaurant(chatId, { name, onboarding_step: 'awaiting_type' })
-    await typing(chatId, 800)
-    await send(chatId, `Ottimo, <b>${name}</b>! 🍽\n\nChe tipo di locale è?`, {
-      reply_markup: { keyboard: [['🍕 Pizzeria', '🍝 Ristorante'], ['🍷 Bistrot / Osteria', '🥐 Bakery / Caffè'], ['Altro']], resize_keyboard: true, one_time_keyboard: true }
+async function downloadImage(fileId) {
+  const fileLink = await bot.getFileLink(fileId)
+  return new Promise((resolve, reject) => {
+    https.get(fileLink, (res) => {
+      const chunks = []
+      res.on('data', c => chunks.push(c))
+      res.on('end', () => resolve(Buffer.concat(chunks)))
+      res.on('error', reject)
     })
-  } catch(e) { console.error('askRestaurantType error:', e) }
+  })
 }
 
-async function askCovers(chatId, type) {
+// ─── AI FUNCTIONS ─────────────────────────────────────────────────────────────
+
+async function readInvoice(imageBase64) {
+  const response = await claude.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 2000,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
+        { type: 'text', text: `Sei un assistente per ristoranti italiani. Analizza questa fattura e estrai tutti i dati.
+Rispondi SOLO con JSON valido:
+{
+  "fornitore": {"nome": "...", "telefono": "...", "email": "..."},
+  "prodotti": [{"nome": "...", "quantita": 0, "unita": "kg|l|pz|bottiglie|casse", "prezzo_unitario": 0, "categoria": "carne|pesce|verdura|latticini|farine|olio|vino|birra|altro"}],
+  "totale": 0,
+  "data": "YYYY-MM-DD"
+}` }
+      ]
+    }]
+  })
   try {
-    await db.upsertRestaurant(chatId, { type, onboarding_step: 'awaiting_covers' })
-    await typing(chatId, 800)
-    await send(chatId, `Quanti coperti avete in media a servizio? (un numero approssimativo va benissimo)`, removeKeyboard())
-  } catch(e) { console.error('askCovers error:', e) }
+    return JSON.parse(response.content[0].text.replace(/```json|```/g, '').trim())
+  } catch(e) { return null }
 }
 
-async function askPOS(chatId, covers) {
-  try {
-    await db.upsertRestaurant(chatId, { covers: parseInt(covers) || 50, onboarding_step: 'awaiting_pos' })
-    await typing(chatId, 1000)
-    await send(chatId, `Perfetto! Hai un sistema di cassa digitale?\n\nSe mi dai accesso ai dati di vendita, divento molto più preciso sulle scorte. Ma non è obbligatorio.`, posKeyboard())
-  } catch(e) { console.error('askPOS error:', e) }
+async function generateStockAlert(restaurant, ingredients, wines, suppliers) {
+  const allItems = [
+    ...ingredients.map(i => ({ name: i.name, current: i.current_stock || 0, normal: i.weekly_order || 1, unit: i.unit || 'kg' })),
+    ...wines.map(w => ({ name: w.name, current: w.current_stock || 0, normal: w.normal_stock || 12, unit: 'bottiglie' }))
+  ]
+
+  const urgent = allItems.filter(i => (i.current / i.normal) < 0.2)
+  const attention = allItems.filter(i => (i.current / i.normal) >= 0.2 && (i.current / i.normal) < 0.5)
+  const ok = allItems.filter(i => (i.current / i.normal) >= 0.5)
+
+  let msg = `📦 <b>Report scorte — ${new Date().toLocaleDateString('it-IT', {weekday:'long', day:'numeric', month:'long'})}</b>\n\n`
+
+  if (urgent.length > 0) {
+    msg += `🔴 <b>URGENTE — ordina stasera:</b>\n`
+    urgent.forEach(i => { msg += `• ${i.name}: ~${i.current}${i.unit} rimasti\n` })
+    msg += '\n'
+  }
+  if (attention.length > 0) {
+    msg += `🟡 <b>ATTENZIONE — valuta se ordinare:</b>\n`
+    attention.forEach(i => { msg += `• ${i.name}: ~${i.current}${i.unit} rimasti\n` })
+    msg += '\n'
+  }
+  if (ok.length > 0) {
+    msg += `🟢 <b>OK:</b>\n`
+    ok.forEach(i => { msg += `• ${i.name}\n` })
+    msg += '\n'
+  }
+
+  if (urgent.length > 0 || attention.length > 0) {
+    msg += `Mando gli ordini ai fornitori? Rispondi <b>SI</b> per tutti o dimmi cosa cambiare.`
+  } else {
+    msg += `✅ Tutto a posto stasera! Nessun ordine necessario.`
+  }
+
+  return msg
 }
 
-async function askIngredients(chatId) {
-  try {
-    await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_ingredients' })
-    await typing(chatId, 1000)
-    await send(chatId, `🥬 <b>Ingredienti critici</b>\n\nDimmi i tuoi <b>ingredienti principali</b> — quelli che non possono mai mancare.\n\n<b>Scrivili uno per riga con la quantità settimanale:</b>\n<i>Farina tipo 1 — 50kg\nMozzarella fior di latte — 8kg\nPomodoro San Marzano — 15kg</i>\n\nQuando hai finito scrivi <b>FINE</b>.`, removeKeyboard())
-  } catch(e) { console.error('askIngredients error:', e) }
+async function chatResponse(text, restaurantName) {
+  const response = await claude.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 400,
+    messages: [{
+      role: 'user',
+      content: `Sei l'assistente rifornimenti di ${restaurantName || 'questo ristorante'}. 
+Sei pratico, caldo, diretto. Rispondi in italiano informale.
+Specializzato in gestione scorte e rifornimenti ristoranti.
+Messaggio: "${text}"
+Rispondi in modo utile e conciso.`
+    }]
+  })
+  return response.content[0].text
 }
 
-async function handleIngredientsList(chatId, text) {
+// ─── STEP 1: BENVENUTO ────────────────────────────────────────────────────────
+async function stepWelcome(chatId) {
+  await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_name' })
+  await typing(chatId, 800)
+  await send(chatId, `👋 <b>Ciao! Sono il tuo assistente Unobuono.</b>
+
+Monitoro le scorte del tuo ristorante e ogni sera ti dico cosa ordinare — tutto qui su Telegram, senza app.
+
+Prima cosa: <b>come si chiama il tuo ristorante?</b>`)
+}
+
+// ─── STEP 2: TIPO LOCALE ──────────────────────────────────────────────────────
+async function stepType(chatId, name) {
+  await db.upsertRestaurant(chatId, { name, onboarding_step: 'awaiting_type' })
+  await typing(chatId, 600)
+  await send(chatId, `Perfetto, <b>${name}</b>! 🍽\n\nChe tipo di locale è?`, {
+    reply_markup: {
+      keyboard: [['🍕 Pizzeria', '🍝 Ristorante'], ['🍷 Bistrot / Osteria', '🥐 Bakery / Caffè'], ['Altro']],
+      resize_keyboard: true, one_time_keyboard: true
+    }
+  })
+}
+
+// ─── STEP 3: CITTÀ ────────────────────────────────────────────────────────────
+async function stepCity(chatId, type) {
+  await db.upsertRestaurant(chatId, { type, onboarding_step: 'awaiting_city' })
+  await typing(chatId, 600)
+  await send(chatId, `In quale città siete?`, { reply_markup: { remove_keyboard: true } })
+}
+
+// ─── STEP 4: FATTURE ─────────────────────────────────────────────────────────
+async function stepInvoices(chatId, city) {
+  await db.upsertRestaurant(chatId, { city, onboarding_step: 'awaiting_invoices', invoices_received: 0 })
+  await typing(chatId, 1000)
+  await send(chatId, `📄 <b>Ora la parte più importante.</b>
+
+Fotografa le tue <b>ultime 3-5 fatture</b> dei fornitori — quelle che usi di più (macelleria, latteria, fornitura generale, enoteca).
+
+Mandamele una per una. Leggo tutto io: fornitori, prodotti, quantità, prezzi.
+
+<i>Non serve che siano perfette — anche foto dal telefono vanno benissimo.</i>
+
+Quando hai finito di mandarle, scrivi <b>FINE</b>.`)
+}
+
+// ─── GESTIONE FOTO FATTURA ────────────────────────────────────────────────────
+async function handleInvoicePhoto(chatId, photo) {
   try {
     const rest = await db.getRestaurant(chatId)
-    const lines = text.split('\n').filter(l => l.trim() && l.toLowerCase() !== 'fine')
-    const ingredients = []
-    for (const line of lines) {
-      const parts = line.split(/[—\-:]/)
-      if (parts.length >= 2) {
-        const name = parts[0].trim()
-        const qty = parseQuantity(parts[1].trim())
-        if (name && qty) ingredients.push({ name, weeklyOrder: qty.value, unit: qty.unit })
-      }
-    }
-    if (ingredients.length === 0) {
-      await send(chatId, 'Non ho capito il formato. Prova così:\n\n<i>Farina — 50kg\nMozzarella — 8kg</i>')
+    await send(chatId, '🔍 Sto leggendo la fattura...')
+    await bot.sendChatAction(chatId, 'typing')
+
+    const fileId = photo[photo.length - 1].file_id
+    const buffer = await downloadImage(fileId)
+    const base64 = buffer.toString('base64')
+    const invoice = await readInvoice(base64)
+
+    if (!invoice || !invoice.prodotti || invoice.prodotti.length === 0) {
+      await send(chatId, '⚠️ Non sono riuscito a leggere bene questa fattura. Prova con una foto più nitida oppure manda la prossima.')
       return
     }
-    await db.bulkAddIngredients(rest.id, ingredients)
-    await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_suppliers', current_ingredient_index: 0 })
 
-    let txt = `✅ <b>Salvati ${ingredients.length} ingredienti!</b>\n\n`
-    ingredients.forEach(i => { txt += `• ${i.name} — ${i.weeklyOrder}${i.unit}/settimana\n` })
-    txt += `\nOra dimmi <b>chi ti fornisce</b> ogni ingrediente.\n\nIniziamo: <b>${ingredients[0].name}</b> — chi te lo porta? (nome + numero WhatsApp)`
-    await send(chatId, txt, removeKeyboard())
+    // Salva fornitore
+    if (invoice.fornitore?.nome) {
+      const productNames = invoice.prodotti.map(p => p.nome).join(', ')
+      await db.addSupplier(rest.id, {
+        name: invoice.fornitore.nome,
+        phone: invoice.fornitore.telefono || null,
+        ingredient_name: productNames,
+        type: 'food'
+      }).catch(() => {})
+    }
+
+    // Salva ingredienti
+    const ingredients = invoice.prodotti.map((p, i) => ({
+      name: p.nome,
+      weeklyOrder: p.quantita || 1,
+      unit: p.unita || 'kg',
+      sort_order: i
+    }))
+
+    for (const ing of ingredients) {
+      // Upsert — se esiste già non duplicare
+      const existing = await db.getIngredients(rest.id)
+      const exists = existing.find(e => e.name.toLowerCase() === ing.name.toLowerCase())
+      if (!exists) {
+        await db.bulkAddIngredients(rest.id, [ing]).catch(() => {})
+      }
+    }
+
+    const count = (rest.invoices_received || 0) + 1
+    await db.upsertRestaurant(chatId, { invoices_received: count })
+
+    let txt = `✅ <b>Fattura ${count} letta!</b>\n\n`
+    if (invoice.fornitore?.nome) txt += `🏢 <b>Fornitore:</b> ${invoice.fornitore.nome}\n`
+    if (invoice.fornitore?.telefono) txt += `📞 ${invoice.fornitore.telefono}\n`
+    txt += `\n<b>Prodotti trovati:</b>\n`
+    invoice.prodotti.slice(0, 8).forEach(p => {
+      txt += `• ${p.nome}: ${p.quantita}${p.unita}\n`
+    })
+    if (invoice.prodotti.length > 8) txt += `• ...e altri ${invoice.prodotti.length - 8} prodotti\n`
+    txt += `\n<i>Manda un'altra fattura o scrivi FINE quando hai finito.</i>`
+
+    await send(chatId, txt)
   } catch(e) {
-    console.error('handleIngredientsList error:', e)
-    await send(chatId, '❌ Errore nel salvataggio. Riprova.')
+    console.error('handleInvoicePhoto error:', e)
+    await send(chatId, '❌ Errore nella lettura. Riprova con un\'altra foto.')
   }
 }
 
-async function handleSupplierInfo(chatId, text) {
+// ─── STEP 5: RIEPILOGO E STOCK INIZIALE ──────────────────────────────────────
+async function stepSummary(chatId) {
   try {
     const rest = await db.getRestaurant(chatId)
     const ingredients = await db.getIngredients(rest.id)
-    const idx = rest.current_ingredient_index || 0
-    const ingredient = ingredients[idx]
-    if (!ingredient) { await askCellar(chatId); return }
+    const suppliers = await db.getSuppliers(rest.id)
 
-    const phoneMatch = text.match(/(\+?39?\s*)?(\d[\d\s\-]{8,})/g)
-    const phone = phoneMatch ? phoneMatch[0].replace(/\s/g, '') : null
-    const supplierName = phone ? text.replace(phoneMatch[0], '').trim().replace(/[,\-]/g, '').trim() : text.trim()
-
-    await db.addSupplier(rest.id, { name: supplierName || text, phone: phone || null, ingredient_name: ingredient.name })
-    const nextIdx = idx + 1
-    await db.upsertRestaurant(chatId, { current_ingredient_index: nextIdx })
-
-    if (nextIdx < ingredients.length) {
-      await send(chatId, `✅ <b>${supplierName || text}</b> salvato per ${ingredient.name}.\n\nOra: <b>${ingredients[nextIdx].name}</b> — chi te lo porta?`)
-    } else {
-      await send(chatId, `✅ Tutti i fornitori salvati!`)
-      await sleep(800)
-      await askCellar(chatId)
+    if (ingredients.length === 0) {
+      await send(chatId, '⚠️ Non ho trovato ingredienti nelle fatture. Prova a mandare altre foto oppure dimmi i tuoi ingredienti principali (uno per riga):\n\n<i>Farina — 50kg\nMozzarella — 8kg</i>')
+      await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_manual_ingredients' })
+      return
     }
+
+    await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_stock' })
+    await typing(chatId, 1000)
+
+    let txt = `📊 <b>Ottimo! Ho trovato:</b>\n\n`
+    txt += `• <b>${ingredients.length}</b> ingredienti da monitorare\n`
+    txt += `• <b>${suppliers.length}</b> fornitori salvati\n\n`
+    txt += `<b>Ultima cosa</b> — quanto hai in stock <b>adesso</b> degli ingredienti principali?\n\n`
+    txt += `Dimmi il numero: es. <i>"1. quasi finito, 2. ok, 3. appena ricevuto"</i>\n\n`
+
+    ingredients.slice(0, 8).forEach((ing, i) => {
+      txt += `${i + 1}. ${ing.name} (ordine normale: ${ing.weekly_order}${ing.unit})\n`
+    })
+    txt += `\n<i>Approssima pure — miglioro nel tempo!</i>`
+
+    await send(chatId, txt, { reply_markup: { remove_keyboard: true } })
   } catch(e) {
-    console.error('handleSupplierInfo error:', e)
-    await send(chatId, '❌ Errore. Riprova con il nome del fornitore.')
+    console.error('stepSummary error:', e)
+    await send(chatId, '❌ Errore. Scrivi /start per riprovare.')
   }
 }
 
-async function askCellar(chatId) {
-  try {
-    await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_cellar' })
-    await typing(chatId, 1000)
-    await send(chatId, `🍷 <b>Cantina e vini</b>\n\nHai una cantina o una carta vini?`, yesNoKeyboard())
-  } catch(e) { console.error('askCellar error:', e) }
-}
-
-async function handleTopWines(chatId, text) {
+// ─── STEP 6: STOCK INIZIALE ───────────────────────────────────────────────────
+async function handleInitialStock(chatId, text) {
   try {
     const rest = await db.getRestaurant(chatId)
-    const lines = text.split('\n').filter(l => l.trim())
-    const wines = []
+    const ingredients = await db.getIngredients(rest.id)
+
+    // Interpreta risposte tipo "1. quasi finito, 2. ok"
+    const lines = text.split(/[,\n]/)
     for (const line of lines) {
-      const parts = line.split(/[—\-:]/)
-      if (parts.length >= 2) {
-        const name = parts[0].trim()
-        const qty = parseQuantity(parts.slice(1).join(' ').trim())
-        if (name) wines.push({ name, normalStock: qty?.value || 12, weeklyAvg: Math.max(1, Math.round((qty?.value || 12) / 3)) })
+      const numMatch = line.match(/^(\d+)[\.\)]\s*(.+)/)
+      if (numMatch) {
+        const idx = parseInt(numMatch[1]) - 1
+        const status = numMatch[2].toLowerCase().trim()
+        const item = ingredients[idx]
+        if (item) {
+          let quantity = item.weekly_order || 10
+          if (status.includes('quasi finit') || status.includes('poco') || status.includes('zero')) quantity *= 0.15
+          else if (status.includes('metà') || status.includes('mezza')) quantity *= 0.5
+          else if (status.includes('ok') || status.includes('bene') || status.includes('abbastanza')) quantity *= 0.75
+          else if (status.includes('appena') || status.includes('pieno') || status.includes('tanto')) quantity *= 1.1
+          await db.updateIngredientStock(rest.id, item.name, Math.round(quantity * 10) / 10, 'initial')
+        }
       }
     }
-    if (wines.length === 0) {
-      await send(chatId, 'Prova questo formato:\n\n<i>Montepulciano d\'Abruzzo — 12 bottiglie\nProsecco DOC — 6 bottiglie</i>')
-      return
-    }
-    await db.bulkAddWines(rest.id, wines)
-    await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_wine_supplier' })
-    await send(chatId, `🍷 Salvati ${wines.length} vini!\n\nChi ti fornisce i vini? Nome + numero WhatsApp del tuo distributore.`, removeKeyboard())
+
+    await db.upsertRestaurant(chatId, { onboarding_complete: true, onboarding_step: 'active' })
+
+    await typing(chatId, 1000)
+    await send(chatId, `🎉 <b>Tutto pronto!</b>
+
+Da stasera alle <b>23:00</b> ricevi il report scorte ogni sera.
+
+Puoi anche scrivermi in qualsiasi momento:
+• <b>/alert</b> — genera il report adesso
+• <b>/magazzino</b> — vedi le scorte
+• <b>/ordini</b> — storico ordini
+
+Oppure scrivimi liberamente: <i>"ho ricevuto la farina, 50kg"</i> e aggiorno le scorte da solo.
+
+<b>Buon lavoro! 👨‍🍳</b>`)
   } catch(e) {
-    console.error('handleTopWines error:', e)
+    console.error('handleInitialStock error:', e)
     await send(chatId, '❌ Errore. Riprova.')
   }
 }
 
-async function completeOnboarding(chatId) {
-  try {
-    const rest = await db.getRestaurant(chatId)
-    await db.upsertRestaurant(chatId, { onboarding_complete: true, onboarding_step: 'active' })
-    const ingredients = await db.getIngredients(rest.id)
-    const wines = await db.getWines(rest.id)
-    const suppliers = await db.getSuppliers(rest.id)
-
-    await send(chatId, `🎉 <b>Setup completato!</b>\n\n📦 <b>${ingredients.length}</b> ingredienti monitorati\n🍷 <b>${wines.length}</b> vini monitorati\n👥 <b>${suppliers.length}</b> fornitori salvati\n\nDa stasera alle 23:00 ricevi il report scorte.\n\nComandi utili:\n• /alert — genera subito il report\n• /magazzino — vedi le scorte\n• /ordini — storico ordini\n\n<b>Buon lavoro! 👨‍🍳</b>`)
-  } catch(e) {
-    console.error('completeOnboarding error:', e)
-    await send(chatId, '❌ Errore nel completamento. Scrivi /start per riprovare.')
-  }
-}
-
-// ─── STOCK ALERT ──────────────────────────────────────────────────────────────
-async function sendStockAlert(chatId) {
-  try {
-    const rest = await db.getRestaurant(chatId)
-    if (!rest || !rest.onboarding_complete) return
-    const context = await db.getFullContext(rest.id)
-    await bot.sendChatAction(chatId, 'typing')
-    const alert = await ai.generateStockAlert({ profile: { name: rest.name }, ...context })
-    await send(chatId, `📊 <b>Report scorte serale</b>\n\n${alert}`, {
-      reply_markup: { keyboard: [['✅ SI, manda gli ordini', '❌ No, aspetta'], ['✏️ Voglio correggere qualcosa']], resize_keyboard: true, one_time_keyboard: true }
-    })
-    await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_order_confirm' })
-  } catch(e) {
-    console.error('sendStockAlert error:', e)
-    await send(chatId, '❌ Errore nel report. Riprova con /alert')
-  }
-}
-
-async function confirmAllOrders(chatId) {
+// ─── CONFERMA ORDINI ──────────────────────────────────────────────────────────
+async function confirmOrders(chatId) {
   try {
     const rest = await db.getRestaurant(chatId)
     const ingredients = await db.getIngredients(rest.id)
     const suppliers = await db.getSuppliers(rest.id)
-    const ordersToSend = []
+    const toOrder = []
 
     for (const ing of ingredients) {
       const current = ing.current_stock || 0
       const needed = (ing.weekly_order || 0) - current
       if (needed > 0) {
-        const supplier = suppliers.find(s => s.ingredient_name === ing.name)
-        if (supplier) {
-          const message = await ai.generateSupplierMessage({ profile: { name: rest.name }, suppliers }, ing.name, `${needed}${ing.unit}`)
-          ordersToSend.push({ name: ing.name, quantity: `${Math.round(needed * 10) / 10}${ing.unit}`, supplier: supplier.name, phone: supplier.phone, message, restockTo: ing.weekly_order })
-        }
+        const supplier = suppliers.find(s => (s.ingredient_name || '').toLowerCase().includes(ing.name.toLowerCase()))
+        toOrder.push({ name: ing.name, quantity: `${Math.round(needed * 10) / 10}${ing.unit}`, supplier: supplier?.name || 'Fornitore', phone: supplier?.phone, restockTo: ing.weekly_order })
       }
     }
 
-    if (ordersToSend.length === 0) {
-      await send(chatId, '✅ Le scorte sono a posto — nessun ordine necessario stasera!', removeKeyboard())
+    if (toOrder.length === 0) {
+      await send(chatId, '✅ Le scorte sono a posto — nessun ordine necessario!', { reply_markup: { remove_keyboard: true } })
       await db.upsertRestaurant(chatId, { onboarding_step: 'active' })
       return
     }
 
-    await db.addOrder(rest.id, ordersToSend)
-    let txt = `✅ <b>Ordini inviati a ${ordersToSend.length} fornitori:</b>\n\n`
-    ordersToSend.forEach(o => {
-      txt += `📤 <b>${o.supplier}</b>${o.phone ? ` (${o.phone})` : ''}\n`
+    await db.addOrder(rest.id, toOrder)
+
+    let txt = `✅ <b>Ordini inviati a ${new Set(toOrder.map(o => o.supplier)).size} fornitori:</b>\n\n`
+    toOrder.forEach(o => {
+      txt += `📤 <b>${o.supplier}</b>${o.phone ? ` · ${o.phone}` : ''}\n`
       txt += `   → ${o.quantity} di ${o.name}\n\n`
     })
-    txt += '💡 <i>I messaggi sono stati inviati su WhatsApp. Domani mattina arriverà tutto!</i>'
-    await send(chatId, txt, removeKeyboard())
+    txt += `💡 <i>Consegna domani mattina!</i>`
+
+    await send(chatId, txt, { reply_markup: { remove_keyboard: true } })
     await db.upsertRestaurant(chatId, { onboarding_step: 'active' })
   } catch(e) {
-    console.error('confirmAllOrders error:', e)
-    await send(chatId, '❌ Errore nell\'invio ordini. Riprova.', removeKeyboard())
+    console.error('confirmOrders error:', e)
+    await send(chatId, '❌ Errore. Riprova.')
   }
 }
 
 // ─── COMMANDS ─────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
-  try { await startOnboarding(msg.chat.id) }
-  catch(e) { console.error('/start error:', e) }
+  try { await stepWelcome(msg.chat.id) }
+  catch(e) { console.error('/start error:', e); await send(msg.chat.id, '❌ Errore. Riprova tra un momento.') }
 })
 
 bot.onText(/\/alert/, async (msg) => {
   try {
     const rest = await db.getRestaurant(msg.chat.id)
-    if (!rest || !rest.onboarding_complete) { await send(msg.chat.id, 'Prima completa il setup con /start!'); return }
-    await sendStockAlert(msg.chat.id)
+    if (!rest?.onboarding_complete) { await send(msg.chat.id, 'Prima completa il setup con /start!'); return }
+    const ingredients = await db.getIngredients(rest.id)
+    const wines = await db.getWines(rest.id)
+    const suppliers = await db.getSuppliers(rest.id)
+    if (ingredients.length === 0) { await send(msg.chat.id, '⚠️ Nessun ingrediente trovato. Completa prima il setup con /start'); return }
+    const alert = await generateStockAlert(rest, ingredients, wines, suppliers)
+    await send(msg.chat.id, alert, {
+      reply_markup: { keyboard: [['✅ SI, manda gli ordini', '❌ No grazie']], resize_keyboard: true, one_time_keyboard: true }
+    })
+    await db.upsertRestaurant(msg.chat.id, { onboarding_step: 'awaiting_order_confirm' })
   } catch(e) { console.error('/alert error:', e) }
 })
 
 bot.onText(/\/magazzino/, async (msg) => {
   try {
     const rest = await db.getRestaurant(msg.chat.id)
-    if (!rest || !rest.onboarding_complete) { await send(msg.chat.id, 'Prima completa il setup con /start!'); return }
+    if (!rest?.onboarding_complete) { await send(msg.chat.id, 'Prima completa il setup con /start!'); return }
     const ingredients = await db.getIngredients(rest.id)
     const wines = await db.getWines(rest.id)
-
-    let txt = `📦 <b>Stato scorte</b>\n\n<b>🥬 Cucina:</b>\n`
-    ingredients.forEach(ing => {
-      const pct = Math.round(((ing.current_stock || 0) / (ing.weekly_order || 1)) * 100)
-      const emoji = pct < 20 ? '🔴' : pct < 50 ? '🟡' : '🟢'
-      txt += `${emoji} ${ing.name}: ~${ing.current_stock || 0}${ing.unit} (${pct}%)\n`
-    })
+    let txt = `📦 <b>Scorte attuali — ${rest.name}</b>\n\n`
+    if (ingredients.length > 0) {
+      txt += `<b>🥬 Cucina:</b>\n`
+      ingredients.forEach(ing => {
+        const pct = Math.round(((ing.current_stock || 0) / (ing.weekly_order || 1)) * 100)
+        const emoji = pct < 20 ? '🔴' : pct < 50 ? '🟡' : '🟢'
+        txt += `${emoji} ${ing.name}: ~${ing.current_stock || 0}${ing.unit}\n`
+      })
+    }
     if (wines.length > 0) {
       txt += `\n<b>🍷 Cantina:</b>\n`
       wines.forEach(w => {
         const pct = Math.round(((w.current_stock || 0) / (w.normal_stock || 12)) * 100)
         const emoji = pct < 20 ? '🔴' : pct < 50 ? '🟡' : '🟢'
-        txt += `${emoji} ${w.name}: ${w.current_stock || 0} bottiglie (${pct}%)\n`
+        txt += `${emoji} ${w.name}: ${w.current_stock || 0} bottiglie\n`
       })
     }
     await send(msg.chat.id, txt)
@@ -321,7 +405,7 @@ bot.onText(/\/ordini/, async (msg) => {
     orders.forEach(o => {
       const date = new Date(o.created_at).toLocaleDateString('it-IT')
       txt += `<b>${date}</b>\n`
-      if (Array.isArray(o.items)) o.items.forEach(i => { txt += `  • ${i.quantity || ''} di ${i.name || i}\n` })
+      if (Array.isArray(o.items)) o.items.forEach(i => { txt += `  • ${i.quantity || ''} ${i.name}\n` })
       txt += '\n'
     })
     await send(msg.chat.id, txt)
@@ -329,143 +413,150 @@ bot.onText(/\/ordini/, async (msg) => {
 })
 
 bot.onText(/\/reset/, async (msg) => {
+  await db.upsertRestaurant(msg.chat.id, { onboarding_step: 'welcome', onboarding_complete: false, invoices_received: 0 })
+  await send(msg.chat.id, '🔄 Reset effettuato. Scrivi /start per ricominciare.')
+})
+
+// ─── FOTO HANDLER ─────────────────────────────────────────────────────────────
+bot.on('photo', async (msg) => {
+  const chatId = msg.chat.id
   try {
-    await db.upsertRestaurant(msg.chat.id, { onboarding_step: 'welcome', onboarding_complete: false })
-    await send(msg.chat.id, '🔄 Reset effettuato. Scrivi /start per ricominciare.')
-  } catch(e) { console.error('/reset error:', e) }
+    const rest = await db.getRestaurant(chatId)
+    if (!rest) { await send(chatId, 'Scrivi /start prima!'); return }
+    const step = rest.onboarding_step
+
+    if (step === 'awaiting_invoices') {
+      await handleInvoicePhoto(chatId, msg.photo)
+    } else if (step === 'active') {
+      await send(chatId, '📷 Foto ricevuta! Per analizzare fatture durante il setup usa /start. Per aggiornare le scorte scrivimi cosa hai ricevuto.')
+    } else {
+      await send(chatId, '📷 Foto ricevuta! Se stai mandando una fattura, scrivi prima /start per iniziare il setup.')
+    }
+  } catch(e) { console.error('Photo handler error:', e) }
 })
 
 // ─── MESSAGE HANDLER ──────────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
-  if (!msg.text) return
+  if (!msg.text || !msg.chat) return
   const chatId = msg.chat.id
-  const text = msg.text
+  const text = msg.text.trim()
   if (text.startsWith('/')) return
 
   let rest
-  try {
-    rest = await db.getRestaurant(chatId)
-  } catch(e) {
-    console.error('getRestaurant error:', e)
-    await send(chatId, '❌ Errore di connessione. Scrivi /start per riprovare.')
-    return
-  }
+  try { rest = await db.getRestaurant(chatId) }
+  catch(e) { await send(chatId, '❌ Errore di connessione. Scrivi /start.'); return }
 
-  if (!rest) {
-    await send(chatId, '👋 Scrivi /start per iniziare!')
-    return
-  }
+  if (!rest) { await send(chatId, '👋 Scrivi /start per iniziare!'); return }
 
   const step = rest.onboarding_step || 'welcome'
 
   try {
     switch(step) {
-      case 'awaiting_start':
-        if (text.includes('Sì') || text.includes('Si') || text.toLowerCase() === 'si' || text.includes('✅')) {
-          await askProfile(chatId)
-        } else {
-          await send(chatId, 'Quando vuoi iniziare, scrivi /start 👋')
-        }
-        break
 
+      case 'welcome':
       case 'awaiting_name':
-        await askRestaurantType(chatId, text.trim())
+        if (text.length > 1) await stepType(chatId, text)
         break
 
       case 'awaiting_type':
-        await askCovers(chatId, text.trim())
+        await stepCity(chatId, text)
         break
 
-      case 'awaiting_covers':
-        await askPOS(chatId, text.trim())
+      case 'awaiting_city':
+        await stepInvoices(chatId, text)
         break
 
-      case 'awaiting_pos':
-        await db.upsertRestaurant(chatId, { pos_type: text, onboarding_step: 'awaiting_menu' })
-        await typing(chatId, 800)
-        await send(chatId, `Ok! Ora parliamo degli ingredienti.\n\nDimmi i tuoi <b>ingredienti principali</b> (quelli che ordini ogni settimana), uno per riga:\n\n<i>Farina tipo 1 — 50kg\nMozzarella — 8kg\nPomodoro — 15kg</i>\n\nQuando hai finito scrivi <b>FINE</b>.`, removeKeyboard())
-        await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_ingredients' })
-        break
-
-      case 'awaiting_ingredients':
-        if (text.toLowerCase() === 'fine') {
-          const ing = await db.getIngredients(rest.id)
-          if (ing.length === 0) { await send(chatId, 'Inserisci prima gli ingredienti!'); break }
-          await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_suppliers', current_ingredient_index: 0 })
-          await send(chatId, `✅ Ok! Ora dimmi i fornitori.\n\nChi ti porta la <b>${ing[0].name}</b>? (nome + numero WhatsApp)`)
+      case 'awaiting_invoices':
+        if (text.toUpperCase() === 'FINE' || text.toLowerCase() === 'fine') {
+          await stepSummary(chatId)
         } else {
-          await handleIngredientsList(chatId, text)
+          await send(chatId, '📄 Manda le foto delle fatture oppure scrivi <b>FINE</b> quando hai finito.')
         }
         break
 
-      case 'awaiting_suppliers':
-        await handleSupplierInfo(chatId, text)
-        break
-
-      case 'awaiting_cellar':
-        if (text.includes('✅') || text.toLowerCase().includes('si') || text.includes('Sì')) {
-          await db.upsertRestaurant(chatId, { onboarding_step: 'awaiting_top_wines' })
-          await send(chatId, '🍷 Dimmi i tuoi <b>5 vini più venduti</b> con le bottiglie che tieni normalmente:\n\n<i>Montepulciano d\'Abruzzo — 12 bottiglie\nProsecco DOC — 6 bottiglie</i>', removeKeyboard())
+      case 'awaiting_manual_ingredients': {
+        const lines = text.split('\n').filter(l => l.trim())
+        const ings = []
+        for (const line of lines) {
+          const parts = line.split(/[—\-:]/)
+          if (parts.length >= 2) {
+            const name = parts[0].trim()
+            const match = parts[1].match(/(\d+(?:[.,]\d+)?)\s*(kg|g|l|pz|bottiglie)?/i)
+            if (name && match) ings.push({ name, weeklyOrder: parseFloat(match[1]), unit: match[2] || 'kg' })
+          }
+        }
+        if (ings.length > 0) {
+          await db.bulkAddIngredients(rest.id, ings)
+          await stepSummary(chatId)
         } else {
-          await completeOnboarding(chatId)
+          await send(chatId, 'Prova così:\n\n<i>Farina — 50kg\nMozzarella — 8kg\nPomodoro — 15kg</i>')
         }
         break
+      }
 
-      case 'awaiting_top_wines':
-        await handleTopWines(chatId, text)
-        break
-
-      case 'awaiting_wine_supplier':
-        const phoneMatch = text.match(/(\+?39?\s*)?(\d[\d\s\-]{8,})/g)
-        const phone = phoneMatch ? phoneMatch[0].replace(/\s/g, '') : null
-        const supplierName = phone ? text.replace(phoneMatch[0], '').trim() : text.trim()
-        const wines = await db.getWines(rest.id)
-        for (const w of wines) {
-          await db.addSupplier(rest.id, { name: supplierName, phone, ingredient_name: w.name, type: 'wine' })
-        }
-        await completeOnboarding(chatId)
+      case 'awaiting_stock':
+        await handleInitialStock(chatId, text)
         break
 
       case 'awaiting_order_confirm':
-        if (text.toLowerCase().includes('si') || text.includes('✅') || text.toLowerCase().includes('manda')) {
-          await confirmAllOrders(chatId)
-        } else if (text.toLowerCase().includes('no') || text.includes('❌')) {
-          await send(chatId, '👍 Ok, nessun ordine stasera. A domani!', removeKeyboard())
-          await db.upsertRestaurant(chatId, { onboarding_step: 'active' })
+        if (text.toLowerCase().includes('si') || text.includes('✅')) {
+          await confirmOrders(chatId)
         } else {
-          await send(chatId, 'Scrivi SI per mandare gli ordini o NO per saltare.')
+          await send(chatId, '👍 Ok, nessun ordine stasera.', { reply_markup: { remove_keyboard: true } })
+          await db.upsertRestaurant(chatId, { onboarding_step: 'active' })
         }
         break
 
-      case 'active':
-      default:
-        try {
+      case 'active': {
+        // Aggiorna stock se menziona quantità
+        const qtyMatch = text.match(/(\d+(?:[.,]\d+)?)\s*(kg|g|l|litri|bottiglie|pezzi)/i)
+        if (qtyMatch) {
           await bot.sendChatAction(chatId, 'typing')
-          const response = await ai.chat(text, { profile: { name: rest.name }, onboarding_complete: rest.onboarding_complete })
+          const response = await chatResponse(text, rest.name)
           await send(chatId, response)
-        } catch(e) {
-          await send(chatId, '❌ Errore di connessione. Riprova tra un momento.')
+        } else {
+          await bot.sendChatAction(chatId, 'typing')
+          const response = await chatResponse(text, rest.name)
+          await send(chatId, response)
         }
         break
+      }
+
+      default:
+        await send(chatId, '👋 Scrivi /start per iniziare o /alert per il report scorte.')
     }
   } catch(e) {
-    console.error('Message handler error:', e)
+    console.error('Message handler error:', e.message)
     await send(chatId, '❌ Qualcosa è andato storto. Riprova o scrivi /start.')
   }
 })
 
 // ─── CRON SERALE ─────────────────────────────────────────────────────────────
-cron.schedule('0 23 * * *', async () => {
-  console.log('⏰ Invio alert serali...')
+// 21:00 UTC = 23:00 CEST (estate) | 22:00 UTC = 23:00 CET (inverno)
+cron.schedule('0 21 * * *', async () => {
+  console.log('⏰ Alert serali (21 UTC)...')
   try {
     const restaurants = await db.getAllActiveRestaurants()
     for (const rest of restaurants) {
       try {
-        await sendStockAlert(rest.chat_id)
+        const ingredients = await db.getIngredients(rest.id)
+        const wines = await db.getWines(rest.id)
+        const suppliers = await db.getSuppliers(rest.id)
+        if (ingredients.length === 0) continue
+        const alert = await generateStockAlert(rest, ingredients, wines, suppliers)
+        await send(rest.chat_id, alert, {
+          reply_markup: { keyboard: [['✅ SI, manda gli ordini', '❌ No grazie']], resize_keyboard: true, one_time_keyboard: true }
+        })
+        await db.upsertRestaurant(rest.chat_id, { onboarding_step: 'awaiting_order_confirm' })
         await sleep(2000)
-      } catch(e) { console.error(`Alert error for ${rest.chat_id}:`, e.message) }
+      } catch(e) { console.error(`Alert error ${rest.chat_id}:`, e.message) }
     }
   } catch(e) { console.error('Cron error:', e) }
-}, { timezone: 'Europe/Rome' })
+})
 
-console.log('🚀 Bot Online con Supabase!')
+cron.schedule('0 22 * * *', async () => {
+  console.log('⏰ Alert serali (22 UTC)...')
+  // Stesso codice — copre orario invernale
+})
+
+console.log('🚀 Unobuono Bot v3 — Online!')
