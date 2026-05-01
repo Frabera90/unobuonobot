@@ -57,7 +57,8 @@ async function readInvoice(imageBase64) {
     )
     const data = await response.json()
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || ''
-    console.log('Gemini response:', text.substring(0, 300))
+    console.log('Gemini full data:', JSON.stringify(data).substring(0, 500))
+console.log('Gemini response:', text.substring(0, 300))
     return JSON.parse(text.replace(/```json|```/g, '').trim())
   } catch(e) {
     console.error('readInvoice error:', e.message)
