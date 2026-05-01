@@ -1,13 +1,11 @@
 // bot.js — Unobuono Bot v3 — Onboarding da foto fatture
 require('dotenv').config()
 const TelegramBot = require('node-telegram-bot-api')
-const Anthropic = require('@anthropic-ai/sdk')
 const cron = require('node-cron')
 const https = require('https')
 const db = require('./db')
 
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true })
-const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 // ─── GLOBAL ERROR HANDLERS ────────────────────────────────────────────────────
 process.on('unhandledRejection', (reason) => { console.error('Unhandled:', reason) })
@@ -40,27 +38,31 @@ async function downloadImage(fileId) {
 // ─── AI FUNCTIONS ─────────────────────────────────────────────────────────────
 
 async function readInvoice(imageBase64) {
-  const response = await claude.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 2000,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
-        { type: 'text', text: `Sei un assistente per ristoranti italiani. Analizza questa fattura e estrai tutti i dati.
-Rispondi SOLO con JSON valido:
-{
-  "fornitore": {"nome": "...", "telefono": "...", "email": "..."},
-  "prodotti": [{"nome": "...", "quantita": 0, "unita": "kg|l|pz|bottiglie|casse", "prezzo_unitario": 0, "categoria": "carne|pesce|verdura|latticini|farine|olio|vino|birra|altro"}],
-  "totale": 0,
-  "data": "YYYY-MM-DD"
-}` }
-      ]
-    }]
-  })
   try {
-    return JSON.parse(response.content[0].text.replace(/```json|```/g, '').trim())
-  } catch(e) { return null }
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
+              { text: `Sei un assistente per ristoranti italiani. Analizza questa fattura e estrai tutti i dati. Rispondi SOLO con JSON valido, nessun testo prima o dopo: {"fornitore": {"nome": "...", "telefono": "...", "email": "..."}, "prodotti": [{"nome": "...", "quantita": 0, "unita": "kg", "prezzo_unitario": 0, "categoria": "altro"}], "totale": 0, "data": "YYYY-MM-DD"}` }
+            ]
+          }],
+          generationConfig: { temperature: 0.1 }
+        })
+      }
+    )
+    const data = await response.json()
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || ''
+    console.log('Gemini response:', text.substring(0, 300))
+    return JSON.parse(text.replace(/```json|```/g, '').trim())
+  } catch(e) {
+    console.error('readInvoice error:', e.message)
+    return null
+  }
 }
 
 async function generateStockAlert(restaurant, ingredients, wines, suppliers) {
@@ -101,19 +103,26 @@ async function generateStockAlert(restaurant, ingredients, wines, suppliers) {
 }
 
 async function chatResponse(text, restaurantName) {
-  const response = await claude.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 400,
-    messages: [{
-      role: 'user',
-      content: `Sei l'assistente rifornimenti di ${restaurantName || 'questo ristorante'}. 
-Sei pratico, caldo, diretto. Rispondi in italiano informale.
-Specializzato in gestione scorte e rifornimenti ristoranti.
-Messaggio: "${text}"
-Rispondi in modo utile e conciso.`
-    }]
-  })
-  return response.content[0].text
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{ text: `Sei l'assistente rifornimenti di ${restaurantName || 'questo ristorante'}. Sei pratico, caldo, diretto. Rispondi in italiano informale. Specializzato in gestione scorte ristoranti. Messaggio: "${text}". Rispondi in modo utile e conciso, max 3 righe.` }]
+          }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 300 }
+        })
+      }
+    )
+    const data = await response.json()
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || 'Non ho capito. Riprova.'
+  } catch(e) {
+    console.error('chatResponse error:', e.message)
+    return 'Errore di connessione. Riprova tra un momento.'
+  }
 }
 
 // ─── STEP 1: BENVENUTO ────────────────────────────────────────────────────────
