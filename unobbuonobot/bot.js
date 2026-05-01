@@ -26,15 +26,37 @@ async function send(chatId, text, options = {}) {
 }
 
 async function downloadImage(fileId) {
-  const fileLink = await bot.getFileLink(fileId)
-  return new Promise((resolve, reject) => {
-    https.get(fileLink, (res) => {
-      const chunks = []
-      res.on('data', c => chunks.push(c))
-      res.on('end', () => resolve(Buffer.concat(chunks)))
-      res.on('error', reject)
+  try {
+    const fileLink = await bot.getFileLink(fileId)
+    console.log('Downloading:', fileLink)
+    return new Promise((resolve, reject) => {
+      const url = new URL(fileLink)
+      const options = {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method: 'GET',
+        headers: { 'User-Agent': 'UnobuonoBot/1.0' }
+      }
+      https.get(options, (res) => {
+        if (res.statusCode === 301 || res.statusCode === 302) {
+          https.get(res.headers.location, (res2) => {
+            const chunks = []
+            res2.on('data', c => chunks.push(c))
+            res2.on('end', () => resolve(Buffer.concat(chunks)))
+            res2.on('error', reject)
+          })
+          return
+        }
+        const chunks = []
+        res.on('data', c => chunks.push(c))
+        res.on('end', () => resolve(Buffer.concat(chunks)))
+        res.on('error', reject)
+      }).on('error', reject)
     })
-  })
+  } catch(e) {
+    console.error('downloadImage error:', e)
+    throw e
+  }
 }
 
 // ─── AI FUNCTIONS ─────────────────────────────────────────────────────────────
